@@ -359,8 +359,8 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 		for (i = 0; i < n_blocks; i++)
 		{
 			key.blockNum = from + i;
-			entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
-			if (found)
+			entry = hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
+			if (entry != NULL)
 			{
 				if (lsn > entry->lsn)
 					entry->lsn = lsn;
@@ -371,8 +371,7 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 			}
 			else
 			{
-				entry->lsn = lsn;
-				if (hash_get_num_entries(lastWrittenLsnCache) > LwLsnCache->lastWrittenLsnCacheSize)
+				if (hash_get_num_entries(lastWrittenLsnCache) >= LwLsnCache->lastWrittenLsnCacheSize)
 				{
 					/* Replace least recently used entry */
 					LastWrittenLsnCacheEntry* victim = dlist_container(LastWrittenLsnCacheEntry, lru_node, dlist_pop_head_node(&LwLsnCache->lastWrittenLsnLRU));
@@ -382,6 +381,10 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 
 					hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
 				}
+
+				entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
+				Assert(!found);
+				entry->lsn = lsn;
 			}
 			/* Link to the end of LRU list */
 			dlist_push_tail(&LwLsnCache->lastWrittenLsnLRU, &entry->lru_node);
@@ -456,8 +459,8 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 
 		Assert(lsn >= WalSegMinSize);
 		key.blockNum = blockno + i;
-		entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
-		if (found)
+		entry = hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
+		if (entry != NULL)
 		{
 			if (lsn > entry->lsn)
 				entry->lsn = lsn;
@@ -468,8 +471,7 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 		}
 		else
 		{
-			entry->lsn = lsn;
-			if (hash_get_num_entries(lastWrittenLsnCache) > LwLsnCache->lastWrittenLsnCacheSize)
+			if (hash_get_num_entries(lastWrittenLsnCache) >= LwLsnCache->lastWrittenLsnCacheSize)
 			{
 				/* Replace least recently used entry */
 				LastWrittenLsnCacheEntry* victim = dlist_container(LastWrittenLsnCacheEntry, lru_node, dlist_pop_head_node(&LwLsnCache->lastWrittenLsnLRU));
@@ -479,6 +481,9 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 
 				hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
 			}
+			entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
+			Assert(!found);
+			entry->lsn = lsn;
 		}
 		/* Link to the end of LRU list */
 		dlist_push_tail(&LwLsnCache->lastWrittenLsnLRU, &entry->lru_node);
