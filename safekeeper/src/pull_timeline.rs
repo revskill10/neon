@@ -397,7 +397,15 @@ impl WalResidentTimeline {
         // Drop shared_state to release the lock, before calling wal_residence_guard().
         drop(shared_state);
 
-        let tli_copy = self.wal_residence_guard().await?;
+        // Only SnapshotContext's drop releases the hold: when the guard cannot be taken there is none, so the hold is
+        // released here, or WAL removal on this safekeeper stops for good (neondatabase/neon#12957)
+        let tli_copy = match self.wal_residence_guard().await {
+            Ok(tli) => tli,
+            Err(e) => {
+                self.write_shared_state().await.wal_removal_on_hold = false;
+                return Err(e);
+            }
+        };
         let from_to_segno = send_segments.then_some(from_segno..=upto_segno);
         let bctx = SnapshotContext {
             from_to_segno,
