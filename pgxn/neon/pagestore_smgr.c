@@ -161,7 +161,13 @@ log_newpages_copy(NRelFileInfo * rinfo, ForkNumber forkNum, BlockNumber blkno,
 					 page_std);
 	}
 
-	return ProcLastRecPtr;
+	/*
+	 * The end of the last record written, as the page LSN log_newpages() set:
+	 * the caller uses it as the page's LSN and last-written LSN, and
+	 * ProcLastRecPtr (the record's start) let a read be served an older page
+	 * (neondatabase/neon#12943).
+	 */
+	return XactLastRecEnd;
 }
 #endif /* PG_MAJORVERSION_NUM >= 17 */
 
