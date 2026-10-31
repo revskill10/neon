@@ -1158,6 +1158,35 @@ USER root
 
 #########################################################################################
 #
+# Layers "pg-search-src" and "pg-search-build"
+# ParadeDB's pg_search (BM25 full-text search), built against this image's Postgres with
+# pgrx's unsafe-postgres feature: Neon's Postgres declares its own ABI ("Neon Postgres"),
+# which a stock pg_search package refuses to load. Postgres 17 only (pgrx 0.19.3).
+#
+#########################################################################################
+
+FROM build-deps AS pg-search-src
+ARG PG_VERSION
+WORKDIR /ext-src
+RUN case "${PG_VERSION:?}" in "v17") ;; *) echo "pg_search is built for v17 only" && exit 0;; esac && \
+    wget https://github.com/paradedb/paradedb/archive/refs/tags/v0.26.0.tar.gz -O paradedb.tar.gz && \
+    echo "5b86e1ccdf1a6cd75099ad22c01dc182ab4a279df644cf39d7cf0e86ea7c0630 paradedb.tar.gz" | sha256sum --check && \
+    mkdir paradedb-src && cd paradedb-src && tar xzf ../paradedb.tar.gz --strip-components=1 -C . && \
+    echo "#nothing to test here" > neon-test.sh
+
+FROM pg-build-with-cargo AS pg-search-build
+ARG PG_VERSION
+COPY --from=pg-search-src /ext-src/ /ext-src/
+RUN if [ "${PG_VERSION:?}" != "v17" ]; then mkdir -p /usr/local/pgsql && exit 0; fi && \
+    rustup toolchain install 1.99.0 --profile minimal && \
+    cargo +1.99.0 install --locked --version 0.19.3 cargo-pgrx && \
+    cargo +1.99.0 pgrx init --pg17=/usr/local/pgsql/bin/pg_config && \
+    cd /ext-src/paradedb-src/pg_search && \
+    cargo +1.99.0 pgrx install --release --no-default-features --features pg17,unsafe-postgres \
+      --pg-config /usr/local/pgsql/bin/pg_config
+
+#########################################################################################
+#
 # Layers "pg-onnx-build" and "pgrag-build"
 # Compile "pgrag" extensions
 #
@@ -1671,6 +1700,7 @@ RUN mkdir /usr/local/pgsql
 FROM build-deps AS extensions-minimal
 
 COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-search-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=timescaledb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_cron-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
@@ -1694,6 +1724,7 @@ COPY --from=postgresql-unit-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgvector-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgjwt-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-search-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_jsonschema-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_graphql-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_tiktoken-build /usr/local/pgsql/ /usr/local/pgsql/
