@@ -1179,7 +1179,7 @@ ARG PG_VERSION
 COPY --from=pg-search-src /ext-src/ /ext-src/
 RUN if [ "${PG_VERSION:?}" != "v17" ]; then mkdir -p /usr/local/pgsql && exit 0; fi && \
     rustup toolchain install 1.99.0 --profile minimal && \
-    cargo +1.99.0 install --locked --version 0.19.3 cargo-pgrx && \
+    cargo +1.99.0 install --locked --version 0.19.2 cargo-pgrx && \
     cargo +1.99.0 pgrx init --pg17=/usr/local/pgsql/bin/pg_config && \
     cd /ext-src/paradedb-src/pg_search && \
     cargo +1.99.0 pgrx install --release --no-default-features --features pg17,unsafe-postgres \
