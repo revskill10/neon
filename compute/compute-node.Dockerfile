@@ -1161,7 +1161,7 @@ USER root
 # Layers "pg-search-src" and "pg-search-build"
 # ParadeDB's pg_search (BM25 full-text search), built against this image's Postgres with
 # pgrx's unsafe-postgres feature: Neon's Postgres declares its own ABI ("Neon Postgres"),
-# which a stock pg_search package refuses to load. Postgres 17 only (pgrx 0.19.3).
+# which a stock pg_search package refuses to load. Postgres 17 only (pgrx 0.19.2, as pg_search 0.26.0 pins).
 #
 #########################################################################################
 
