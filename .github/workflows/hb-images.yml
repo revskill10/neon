@@ -38,7 +38,7 @@ jobs:
       - if: steps.exists.outputs.yes != 'true'
         uses: docker/build-push-action@v6
         with:
-          context: build-tools
+          context: .
           file: build-tools/Dockerfile
           build-args: DEBIAN_VERSION=bookworm
           push: true
