@@ -91,6 +91,7 @@ jobs:
           file: compute/compute-node.Dockerfile
           build-args: |
             PG_VERSION=v17
+            EXTENSIONS=hb
             DEBIAN_VERSION=bookworm
             GIT_VERSION=${{ github.sha }}
             BUILD_TAG=hb-${{ github.run_number }}

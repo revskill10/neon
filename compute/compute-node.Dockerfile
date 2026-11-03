@@ -1179,6 +1179,8 @@ ARG PG_VERSION
 # The toolchain and pgrx as nonroot (as the other pgrx layers), then built and installed as root
 RUN if [ "${PG_VERSION:?}" != "v17" ]; then exit 0; fi &&     rustup toolchain install 1.99.0 --profile minimal &&     cargo +1.99.0 install --locked --version 0.19.2 cargo-pgrx &&     cargo +1.99.0 pgrx init --pg17=/usr/local/pgsql/bin/pg_config
 USER root
+# pg_search links OpenBLAS (its IVF clusterer's BLAS backend on Linux, as ParadeDB's docker/Dockerfile.source installs)
+RUN apt-get update && apt-get install -y --no-install-recommends libopenblas-dev && rm -rf /var/lib/apt/lists/*
 COPY --from=pg-search-src /ext-src/ /ext-src/
 WORKDIR /ext-src/paradedb-src/pg_search
 RUN if [ "${PG_VERSION:?}" != "v17" ]; then mkdir -p /usr/local/pgsql && exit 0; fi &&     cargo +1.99.0 pgrx install --release --no-default-features --features pg17,unsafe-postgres       --pg-config /usr/local/pgsql/bin/pg_config
@@ -1705,6 +1707,19 @@ COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #
+# Layer "extensions-hb"
+# HiBusiness's set (EXTENSIONS=hb): the extensions of its standalone company Postgres image
+# (saas-poc dockerfiles/company-postgres.Dockerfile), so a company moves between the two tiers: pgvector and
+# pg_search, with Postgres's contrib (pg_stat_statements, pg_trgm, pgcrypto, uuid-ossp, btree_gin, hstore) from pg-build
+#
+#########################################################################################
+FROM build-deps AS extensions-hb
+
+COPY --from=pgvector-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-search-build /usr/local/pgsql/ /usr/local/pgsql/
+
+#########################################################################################
+#
 # Layer "extensions-all"
 # Bundle together all the extensions
 #
@@ -2025,6 +2040,7 @@ RUN apt update && \
         libevent-2.1-7 \
         libgeos-c1v5 \
         liblz4-1 \
+        libopenblas0 \
         libossp-uuid16 \
         libprotobuf-c1 \
         libreadline8 \
