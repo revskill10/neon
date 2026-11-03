@@ -1,0 +1,65 @@
+# HiBusiness's upkeep of this fork (branch hb/main; saas-poc docs/UNIVERSAL-MECHANISMS.md, section 15, "Upkeep"), weekly:
+#   - the Rust dependencies against RustSec's advisories (cargo deny check advisories, deny.toml's ignores);
+#   - a Postgres 17 minor newer than the one vendor/postgres-v17 carries;
+#   - what upstream (neondatabase/neon) opened in the week: outside contributors still file real bugs.
+# Its findings are the run's summary. The run fails when something needs doing (an advisory, a newer minor), and GitHub
+# mails a failed scheduled run to the repository's owner.
+# GitHub runs a schedule only from the default branch's workflows: this one is on hb/main, the default branch.
+name: hb upkeep
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upkeep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Advisories
+        id: advisories
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+      - name: Postgres 17 minor
+        id: postgres
+        run: |
+          git submodule update --init --depth 1 vendor/postgres-v17
+          ours=$(sed -n "s/^PACKAGE_VERSION='\(.*\)'/\1/p" vendor/postgres-v17/configure)
+          latest=$(git ls-remote --tags https://github.com/postgres/postgres 'refs/tags/REL_17_*' \
+            | sed -n 's|.*refs/tags/REL_17_\([0-9]*\)$|17.\1|p' | sort -V | tail -1)
+          echo "ours=$ours" >> "$GITHUB_OUTPUT"; echo "latest=$latest" >> "$GITHUB_OUTPUT"
+      - name: Upstream this week
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          since=$(date -u -d '7 days ago' +%Y-%m-%d)
+          gh api -X GET search/issues -f q="repo:neondatabase/neon created:>=$since" -f per_page=100 \
+            --jq '.items[] | "- [\(if .pull_request then "PR" else "issue" end) #\(.number)](\(.html_url)) \(.title)"' > upstream.md
+          echo "count=$(wc -l < upstream.md)" >> "$GITHUB_OUTPUT"
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADVISORIES: ${{ steps.advisories.outcome }}
+          OURS: ${{ steps.postgres.outputs.ours }}
+          LATEST: ${{ steps.postgres.outputs.latest }}
+          UPSTREAM: ${{ steps.upstream.outputs.count }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          newer=$([ "$(printf '%s\n%s\n' "$OURS" "$LATEST" | sort -V | tail -1)" != "$OURS" ] && echo yes || echo no)
+          {
+            echo "## Advisories"
+            [ "$ADVISORIES" = success ] && echo "None outside deny.toml's ignores." || echo "**Found:** see the advisories step of $RUN."
+            echo; echo "## Postgres 17"
+            [ "$newer" = yes ] && echo "**$LATEST is out; we carry $OURS.** Port it from neondatabase/postgres's REL_17_STABLE_neon." || echo "We carry $OURS, the latest."
+            echo; echo "## Upstream this week ($UPSTREAM opened)"
+            cat upstream.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$ADVISORIES" = success ] && [ "$newer" = no ]

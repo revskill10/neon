@@ -6,6 +6,8 @@ name: hb images
 on:
   push:
     branches: [hb/main]
+    # The upkeep's workflow changes no image
+    paths-ignore: [.github/workflows/hb-upkeep.yml]
   workflow_dispatch:
 
 permissions:
