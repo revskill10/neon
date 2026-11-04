@@ -3,11 +3,9 @@
 # tagged with the commit it was built from; the platform pins it by digest.
 name: hb images
 
+# Started by hand only, for a release of images: the plan's minutes are scarce, so changes are built and tested
+# locally (hb/local.sh) and a push builds nothing
 on:
-  push:
-    branches: [hb/main]
-    # The upkeep's workflow changes no image
-    paths-ignore: [.github/workflows/hb-upkeep.yml]
   workflow_dispatch:
 
 permissions:
