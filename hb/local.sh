@@ -7,6 +7,7 @@
 #   hb/local.sh check <crate>...        cargo check of those crates
 #   hb/local.sh test <crate>... [-- <cargo test arguments>]   cargo test of those crates
 #   hb/local.sh clippy <crate>...       cargo clippy of those crates, warnings as errors
+#   hb/local.sh ext                     builds Postgres 17 and the Neon extension against it (pgxn/neon)
 #
 # HB_LOCAL_MEMORY (default 7g) caps the container; HB_LOCAL_JOBS (default 4) caps cargo's jobs.
 set -euo pipefail
@@ -42,8 +43,9 @@ case "$command" in
   # We run Postgres 17 only; the Rust bindings (postgres_ffi) still read every version's headers, so the others get
   # their headers only (configure and install headers, nothing compiled)
   headers) run "make -s -j${HB_LOCAL_JOBS:-4} BUILD_DIR=$pg_build POSTGRES_INSTALL_DIR=$pg_install postgres-headers" ;;
+  ext)     run "make -s -j${HB_LOCAL_JOBS:-4} BUILD_DIR=$pg_build POSTGRES_INSTALL_DIR=$pg_install POSTGRES_VERSIONS=v17 NEON_CARGO_ARTIFACT_TARGET_DIR=$target/debug neon-pg-ext-v17" ;;
   check)   run "cargo check --locked $(crates "$@")" ;;
   test)    run "cargo test --locked $(crates "$@")" ;;
   clippy)  run "cargo clippy --locked $(crates "$@") -- -D warnings" ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
 esac
