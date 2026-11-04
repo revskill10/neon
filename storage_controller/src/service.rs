@@ -1481,7 +1481,8 @@ impl Service {
 
         // If the reconciler signals that it failed to notify compute, set this state on
         // the shard so that a future [`TenantShard::maybe_reconcile`] will try again.
-        tenant.pending_compute_notification = result.pending_compute_notification;
+        // A result that finishes late never clears a notification failed after it started (neondatabase/neon#12922)
+        tenant.apply_compute_notification_result(result.pending_compute_notification, result.compute_notification_epoch);
 
         // Let the TenantShard know it is idle.
         tenant.reconcile_complete(result.sequence);
@@ -1604,7 +1605,7 @@ impl Service {
                                 tracing::warn!("Marking shard {tenant_shard_id} for notification retry, due to error {notify_error}");
                                 let mut locked = self.inner.write().unwrap();
                                 if let Some(shard) = locked.tenants.get_mut(&tenant_shard_id) {
-                                    shard.pending_compute_notification = true;
+                                    shard.record_compute_notification_failure();
                                 }
 
                             }
@@ -6648,7 +6649,7 @@ impl Service {
             let mut locked = self.inner.write().unwrap();
             for failed in failed_notifications {
                 if let Some(shard) = locked.tenants.get_mut(&failed) {
-                    shard.pending_compute_notification = true;
+                    shard.record_compute_notification_failure();
                 }
             }
         }

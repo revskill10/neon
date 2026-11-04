@@ -148,6 +148,12 @@ pub(crate) struct TenantShard {
     /// of state that we publish externally in an eventually consistent way.
     pub(crate) pending_compute_notification: bool,
 
+    /// Advanced each time a failed compute notification is recorded outside a reconciler (a startup or shard split
+    /// notification that failed). A reconciler records it when it starts; its result clears
+    /// [`Self::pending_compute_notification`] only if no failure was recorded since, so a result that finishes late
+    /// never clears a newer pending notification (neondatabase/neon#12922).
+    pub(crate) compute_notification_epoch: u64,
+
     /// To do a graceful migration, set this field to the destination pageserver, and optimization
     /// functions will consider this node the best location and react appropriately.
     preferred_node: Option<NodeId>,
@@ -567,6 +573,9 @@ pub(crate) struct ReconcileResult {
 
     /// Set [`TenantShard::pending_compute_notification`] from this flag
     pub(crate) pending_compute_notification: bool,
+
+    /// [`TenantShard::compute_notification_epoch`] when this reconciler started
+    pub(crate) compute_notification_epoch: u64,
 }
 
 impl ObservedState {
@@ -611,6 +620,7 @@ impl TenantShard {
             last_error: Arc::default(),
             consecutive_reconciles_count: 0,
             pending_compute_notification: false,
+            compute_notification_epoch: 0,
             scheduling_policy: ShardSchedulingPolicy::default(),
             preferred_node: None,
         }
@@ -1599,6 +1609,7 @@ impl TenantShard {
         sequence: Sequence,
         mut reconciler: Reconciler,
         must_notify: bool,
+        compute_notification_epoch: u64,
     ) -> ReconcileResult {
         // Attempt to make observed state match intent state
         let result = reconciler.reconcile().await;
@@ -1644,6 +1655,24 @@ impl TenantShard {
             generation: reconciler.generation,
             observed_deltas: reconciler.observed_deltas(),
             pending_compute_notification: reconciler.compute_notify_failure,
+            compute_notification_epoch,
+        }
+    }
+
+    /// A compute notification for this shard failed outside a reconciler: a later reconcile retries it, and no result
+    /// of a reconciler started before now clears it
+    pub(crate) fn record_compute_notification_failure(&mut self) {
+        self.pending_compute_notification = true;
+        self.compute_notification_epoch += 1;
+    }
+
+    /// Takes a reconciler's result: its failure to notify leaves a notification pending; its success clears one only
+    /// if no other failure was recorded since it started (neondatabase/neon#12922)
+    pub(crate) fn apply_compute_notification_result(&mut self, failed: bool, started_at_epoch: u64) {
+        if failed {
+            self.pending_compute_notification = true;
+        } else if started_at_epoch == self.compute_notification_epoch {
+            self.pending_compute_notification = false;
         }
     }
 
@@ -1715,6 +1744,7 @@ impl TenantShard {
 
         tracing::info!(seq=%reconcile_seq, "Spawning Reconciler ({reason:?})");
         let must_notify = self.pending_compute_notification;
+        let compute_notification_epoch = self.compute_notification_epoch;
         let reconciler_span = tracing::info_span!(parent: None, "reconciler", seq=%reconcile_seq,
                                                         tenant_id=%reconciler.tenant_shard_id.tenant_id,
                                                         shard_id=%reconciler.tenant_shard_id.shard_slug());
@@ -1762,7 +1792,7 @@ impl TenantShard {
                     sequence: &sequence_label,
                 };
 
-                let reconcile_fut = Self::reconcile(reconcile_seq, reconciler, must_notify);
+                let reconcile_fut = Self::reconcile(reconcile_seq, reconciler, must_notify, compute_notification_epoch);
                 let long_reconcile_fut = {
                     let label_group = label_group.clone();
                     async move {
@@ -1924,6 +1954,7 @@ impl TenantShard {
             last_error: Arc::default(),
             consecutive_reconciles_count: 0,
             pending_compute_notification: false,
+            compute_notification_epoch: 0,
             delayed_reconcile: false,
             scheduling_policy: serde_json::from_str(&tsp.scheduling_policy).unwrap(),
             preferred_node: None,
@@ -2139,6 +2170,32 @@ pub(crate) mod tests {
 
     /// Test the scheduling behaviors used when a tenant configured for HA is subject
     /// to nodes being marked offline.
+    /// neondatabase/neon#12922: a reconciler that started before a compute notification failed must not clear the
+    /// pending notification when it finishes after that failure; one that started after it may
+    #[test]
+    fn late_reconcile_result_keeps_newer_pending_compute_notification() {
+        let mut shard = make_test_tenant_shard(PlacementPolicy::Attached(1));
+        assert!(!shard.pending_compute_notification);
+
+        // A reconciler starts, with nothing pending
+        let started_at = shard.compute_notification_epoch;
+        // A notification fails meanwhile (a shard split's, or one sent at startup)
+        shard.record_compute_notification_failure();
+        assert!(shard.pending_compute_notification);
+        // The reconciler finishes without notifying, and without failing to: the newer failure stays pending
+        shard.apply_compute_notification_result(false, started_at);
+        assert!(shard.pending_compute_notification, "a late result cleared a newer pending notification");
+
+        // A reconciler started after the failure, which notifies, clears it
+        let started_after = shard.compute_notification_epoch;
+        shard.apply_compute_notification_result(false, started_after);
+        assert!(!shard.pending_compute_notification);
+
+        // A reconciler that fails to notify leaves one pending, whenever it started
+        shard.apply_compute_notification_result(true, started_at);
+        assert!(shard.pending_compute_notification);
+    }
+
     #[test]
     fn tenant_ha_scheduling() -> anyhow::Result<()> {
         // Start with three nodes.  Our tenant will only use two.  The third one is
