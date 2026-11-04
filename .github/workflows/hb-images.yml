@@ -29,6 +29,16 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+      # Each Postgres the images build is the one vendor/revisions.json names: its submodule's commit, read from the
+      # commit itself (a pointer re-staged from an old checkout once built 17.8 while revisions.json said 17.11)
+      - name: Postgres sources as vendor/revisions.json says
+        run: |
+          for v in $(jq -r 'keys[]' vendor/revisions.json); do
+            want=$(jq -r --arg v "$v" '.[$v][1]' vendor/revisions.json)
+            have=$(git ls-tree HEAD "vendor/postgres-$v" | awk '{print $3}')
+            echo "$v: revisions.json $(jq -r --arg v "$v" '.[$v][0]' vendor/revisions.json) $want, submodule $have"
+            [ "$want" = "$have" ] || { echo "::error::vendor/postgres-$v is $have, not $want as vendor/revisions.json says"; exit 1; }
+          done
       # The tag names what the image is built from, so an unchanged build-tools is built once
       - id: tag
         run: echo "tag=$(cat build-tools/Dockerfile build-tools/package.json build-tools/package-lock.json $(find build-tools/patches -type f | sort) | sha256sum | cut -c1-40)-bookworm" >> "$GITHUB_OUTPUT"
