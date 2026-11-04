@@ -157,11 +157,19 @@ impl Drop for RequestCancelled {
     }
 }
 
+/// How long a streamed response waits for its client to take the next chunk before giving up. The writer runs on the
+/// runtime's blocking pool: a client that stops reading would otherwise hold a blocking thread for as long as its
+/// connection stays open, and enough of them starve every other blocking task, `location_config` and `pull_timeline`
+/// among them (neondatabase/neon#12954).
+pub const CLIENT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// An [`std::io::Write`] implementation on top of a channel sending [`bytes::Bytes`] chunks.
 pub struct ChannelWriter {
     buffer: BytesMut,
     pub tx: mpsc::Sender<std::io::Result<Bytes>>,
     written: usize,
+    /// How long a flush waits for the client before failing; none waits for ever
+    stall_timeout: Option<std::time::Duration>,
     /// Time spent waiting for the channel to make progress. It is not the same as time to upload a
     /// buffer because we cannot know anything about that, but this should allow us to understand
     /// the actual time taken without the time spent `std::thread::park`ed.
@@ -178,8 +186,15 @@ impl ChannelWriter {
             buffer: BytesMut::with_capacity(buf_len).split_off(buf_len / 2),
             tx,
             written: 0,
+            stall_timeout: None,
             wait_time: std::time::Duration::ZERO,
         }
+    }
+
+    /// The writer gives up when its client takes nothing for this long (its blocking thread is freed)
+    pub fn with_stall_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stall_timeout = Some(timeout);
+        self
     }
 
     pub fn flush0(&mut self) -> std::io::Result<usize> {
@@ -195,21 +210,29 @@ impl ChannelWriter {
 
         // not ideal to call from blocking code to block_on, but we are sure that this
         // operation does not spawn_blocking other tasks
-        let res: Result<(), ()> = tokio::runtime::Handle::current().block_on(async {
-            self.tx.send(Ok(ready)).await.map_err(|_| ())?;
+        let tx = &self.tx;
+        let send = async move {
+            tx.send(Ok(ready)).await.map_err(|_| ())?;
 
             // throttle sending to allow reuse of our buffer in `write`.
-            self.tx.reserve().await.map_err(|_| ())?;
+            tx.reserve().await.map_err(|_| ())?;
 
             // now the response task has picked up the buffer and hopefully started
             // sending it to the client.
-            Ok(())
-        });
+            Ok::<(), ()>(())
+        };
+        let res: Result<Result<(), ()>, tokio::time::error::Elapsed> = match self.stall_timeout {
+            Some(limit) => tokio::runtime::Handle::current().block_on(tokio::time::timeout(limit, send)),
+            None => Ok(tokio::runtime::Handle::current().block_on(send)),
+        };
 
         self.wait_time += wait_started_at.elapsed();
 
-        if res.is_err() {
-            return Err(std::io::ErrorKind::BrokenPipe.into());
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => return Err(std::io::ErrorKind::BrokenPipe.into()),
+            // The client stopped reading: give the blocking thread back
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
         }
         self.written += n;
         Ok(n)
@@ -255,6 +278,15 @@ pub async fn prometheus_metrics_handler(
     req: Request<Body>,
     force_metric_collection_on_scrape: bool,
 ) -> Result<Response<Body>, ApiError> {
+    prometheus_metrics_handler_with(req, force_metric_collection_on_scrape, CLIENT_STALL_TIMEOUT).await
+}
+
+/// [`prometheus_metrics_handler`], giving up on a client that takes nothing for `stall_timeout`
+pub(crate) async fn prometheus_metrics_handler_with(
+    req: Request<Body>,
+    force_metric_collection_on_scrape: bool,
+    stall_timeout: std::time::Duration,
+) -> Result<Response<Body>, ApiError> {
     SERVE_METRICS_COUNT.inc();
 
     // HADRON
@@ -279,7 +311,7 @@ pub async fn prometheus_metrics_handler(
 
     let body = Body::wrap_stream(ReceiverStream::new(rx));
 
-    let mut writer = ChannelWriter::new(128 * 1024, tx);
+    let mut writer = ChannelWriter::new(128 * 1024, tx).with_stall_timeout(stall_timeout);
 
     let encoder = TextEncoder::new();
 
@@ -352,10 +384,12 @@ pub async fn prometheus_metrics_handler(
                 // abort the response to somehow notify the client that we failed.
                 //
                 // though, most likely the reason for failure is that the receiver is already gone.
+                // Never waits: a client that stopped reading leaves the channel full, and waiting for it would hold
+                // this blocking thread again (neondatabase/neon#12954); dropping the writer ends the stream anyway.
                 drop(
                     writer
                         .tx
-                        .blocking_send(Err(std::io::ErrorKind::BrokenPipe.into())),
+                        .try_send(Err(std::io::ErrorKind::BrokenPipe.into())),
                 );
             }
         }
