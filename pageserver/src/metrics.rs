@@ -4609,6 +4609,12 @@ pub fn preinitialize_metrics(
         Lazy::force(c);
     });
 
+    // HiBusiness: the bytes of layers on disk, exported from the start. Registered on first use otherwise, a
+    // pageserver holding only secondary locations never exported it, and a disk watcher could not tell its figure
+    // (2026-11-09, a pageserver holding one secondary location: no figure at all).
+    Lazy::force(&RESIDENT_PHYSICAL_SIZE_GLOBAL);
+    Lazy::force(&SECONDARY_RESIDENT_PHYSICAL_SIZE);
+
     // Deletion queue stats
     Lazy::force(&DELETION_QUEUE);
 
