@@ -2597,19 +2597,16 @@ neon_redo_read_buffer_filter(XLogReaderState *record, uint8 block_id)
 	}
 
 	/*
-	 * we don't have the buffer in memory, update lwLsn past this record, also
-	 * evict page from file cache
+	 * We don't have the buffer in memory. Redo changes if the page exists in
+	 * LFC; otherwise skip them and update lwLsn past this record. The check
+	 * and the update are one step under the LFC lock, so that no backend can
+	 * store an older version of the page in LFC (a prefetch) between them,
+	 * and only a skipped page gets this record's LwLSN: a backend reading a
+	 * page that redo is still to replay must not wait for this record.
 	 */
 	if (no_redo_needed)
-	{
-		neon_set_lwlsn_block(end_recptr, rinfo, forknum, blkno);
-		/*
-		 * Redo changes if page exists in LFC.
-		 * We should perform this check after assigning LwLSN to prevent
-		 * prefetching of some older version of the page by some other backend.
-		 */
-		no_redo_needed = !lfc_cache_contains(rinfo, forknum, blkno);
-	}
+		no_redo_needed = !lfc_cache_contains_else_set_lwlsn(rinfo, forknum, blkno,
+															 end_recptr);
 
 	LWLockRelease(partitionLock);
 

@@ -2135,10 +2135,13 @@ communicator_read_at_lsnv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber ba
 	 * See also the description on neon_redo_read_buffer_filter below.
 	 *
 	 * NOTE: It is possible that the WAL redo process will still do IO due to
-	 * concurrent failed read IOs. Those IOs should never have a request_lsn
-	 * that is as large as the WAL record we're currently replaying, if it
-	 * weren't for the behaviour of the LwLsn cache that uses the highest
-	 * value of the LwLsn cache when the entry is not found.
+	 * concurrent failed read IOs. Those IOs never have a request_lsn that is
+	 * as large as the WAL record we're currently replaying: only the pages
+	 * redo skips get that LwLSN, and the LwLsn cache does not evict it (so
+	 * the highest value, used when the entry is not found, stays below it)
+	 * until the record is replayed. A backend waiting here while it holds
+	 * the IO of a page that redo replays next would deadlock with redo
+	 * (neondatabase/neon#9955).
 	 */
 	(void) prefetch_register_bufferv(hashkey.buftag, request_lsns, nblocks, mask, false);
 

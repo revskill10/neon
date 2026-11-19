@@ -1048,6 +1048,57 @@ lfc_cache_contains(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno)
 }
 
 /*
+ * For WAL redo of a block that is not in shared buffers (see
+ * neon_redo_read_buffer_filter): returns true if the cache holds the block,
+ * in any state, and redo must then replay it; otherwise sets the block's
+ * LwLSN to lsn and returns false.
+ *
+ * Both happen under lfc_lock, which lfc_prefetch() holds while it compares a
+ * prefetched page's LSN with the block's LwLSN: a prefetch that stored the
+ * block before this call is seen here, and one after it sees the new LwLSN
+ * and does not store the older page.
+ *
+ * A block that redo will replay keeps its LwLSN. Setting it to the record
+ * being replayed would make a backend that reads the block meanwhile wait for
+ * that record's replay while holding the block's buffer IO, which the replay
+ * then waits for (neondatabase/neon#9955).
+ */
+bool
+lfc_cache_contains_else_set_lwlsn(NRelFileInfo rinfo, ForkNumber forkNum,
+								  BlockNumber blkno, XLogRecPtr lsn)
+{
+	BufferTag	tag;
+	FileCacheEntry *entry;
+	int			chunk_offs = BLOCK_TO_CHUNK_OFF(blkno);
+	bool		found = false;
+	uint32		hash;
+
+	if (lfc_maybe_disabled())	/* fast exit if file cache is disabled */
+	{
+		neon_set_lwlsn_block(lsn, rinfo, forkNum, blkno);
+		return false;
+	}
+
+	CopyNRelFileInfoToBufTag(tag, rinfo);
+	tag.forkNum = forkNum;
+	tag.blockNum = blkno - chunk_offs;
+
+	CriticalAssert(BufTagGetRelNumber(&tag) != InvalidRelFileNumber);
+	hash = get_hash_value(lfc_hash, &tag);
+
+	LWLockAcquire(lfc_lock, LW_SHARED);
+	if (LFC_ENABLED())
+	{
+		entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
+		found = entry != NULL && GET_STATE(entry, chunk_offs) != UNAVAILABLE;
+	}
+	if (!found)
+		neon_set_lwlsn_block(lsn, rinfo, forkNum, blkno);
+	LWLockRelease(lfc_lock);
+	return found;
+}
+
+/*
  * Check if page is present in the cache.
  * Returns true if page is found in local cache.
  */

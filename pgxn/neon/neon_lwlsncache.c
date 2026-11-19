@@ -6,6 +6,9 @@
 #include "miscadmin.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#if PG_VERSION_NUM >= 150000
+#include "access/xlogrecovery.h"
+#endif
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -328,6 +331,51 @@ neon_get_lwlsn_v(NRelFileInfo relfilenode, ForkNumber forknum,
 }
 
 /*
+ * Replace the least recently used entry, raising maxLastWrittenLsn to its LSN
+ * if needed. Caller must ensure LastWrittenLsnLock is held in exclusive mode.
+ *
+ * In hot standby, an entry whose LSN replay has not reached yet stays (the
+ * record being replayed: neon_redo_read_buffer_filter() gives it to the pages
+ * it skips). Evicting it would raise maxLastWrittenLsn to that record, so a
+ * backend would read any page missing from the cache at it, and wait for its
+ * replay while holding the page's buffer IO; if the record replays that page
+ * next, the replay waits for the IO and neither moves (neondatabase/neon#9955).
+ * Such entries are few (the pages of one record), so the least recently used
+ * entry that may go is near the head of the list.
+ */
+static void
+EvictLastWrittenLsnCacheEntry(void)
+{
+	LastWrittenLsnCacheEntry *victim = NULL;
+
+	if (RecoveryInProgress())
+	{
+		XLogRecPtr	replayed = GetXLogReplayRecPtr(NULL);
+		dlist_iter	iter;
+
+		dlist_foreach(iter, &LwLsnCache->lastWrittenLsnLRU)
+		{
+			LastWrittenLsnCacheEntry *entry = dlist_container(LastWrittenLsnCacheEntry, lru_node, iter.cur);
+
+			if (entry->lsn <= replayed)
+			{
+				victim = entry;
+				break;
+			}
+		}
+	}
+	if (victim == NULL)
+		victim = dlist_head_element(LastWrittenLsnCacheEntry, lru_node, &LwLsnCache->lastWrittenLsnLRU);
+
+	dlist_delete(&victim->lru_node);
+	/* Adjust max LSN for not cached relations/chunks if needed */
+	if (victim->lsn > LwLsnCache->maxLastWrittenLsn)
+		LwLsnCache->maxLastWrittenLsn = victim->lsn;
+
+	hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
+}
+
+/*
  * Guts for SetLastWrittenLSNForBlockRange.
  * Caller must ensure LastWrittenLsnLock is held in exclusive mode.
  */
@@ -372,15 +420,7 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 			else
 			{
 				if (hash_get_num_entries(lastWrittenLsnCache) >= LwLsnCache->lastWrittenLsnCacheSize)
-				{
-					/* Replace least recently used entry */
-					LastWrittenLsnCacheEntry* victim = dlist_container(LastWrittenLsnCacheEntry, lru_node, dlist_pop_head_node(&LwLsnCache->lastWrittenLsnLRU));
-					/* Adjust max LSN for not cached relations/chunks if needed */
-					if (victim->lsn > LwLsnCache->maxLastWrittenLsn)
-					LwLsnCache->maxLastWrittenLsn = victim->lsn;
-
-					hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
-				}
+					EvictLastWrittenLsnCacheEntry();
 
 				entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
 				Assert(!found);
@@ -472,15 +512,7 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 		else
 		{
 			if (hash_get_num_entries(lastWrittenLsnCache) >= LwLsnCache->lastWrittenLsnCacheSize)
-			{
-				/* Replace least recently used entry */
-				LastWrittenLsnCacheEntry* victim = dlist_container(LastWrittenLsnCacheEntry, lru_node, dlist_pop_head_node(&LwLsnCache->lastWrittenLsnLRU));
-				/* Adjust max LSN for not cached relations/chunks if needed */
-				if (victim->lsn > LwLsnCache->maxLastWrittenLsn)
-					LwLsnCache->maxLastWrittenLsn = victim->lsn;
-
-				hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
-			}
+				EvictLastWrittenLsnCacheEntry();
 			entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
 			Assert(!found);
 			entry->lsn = lsn;
