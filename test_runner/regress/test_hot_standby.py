@@ -7,6 +7,7 @@ import time
 from functools import partial
 
 import pytest
+from fixtures.common_types import Lsn
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     NeonEnv,
@@ -16,7 +17,7 @@ from fixtures.neon_fixtures import (
     tenant_get_shards,
     wait_replica_caughtup,
 )
-from fixtures.utils import wait_until
+from fixtures.utils import USE_LFC, wait_until
 
 
 def test_hot_standby(neon_simple_env: NeonEnv):
@@ -368,3 +369,200 @@ def test_replica_query_race(neon_simple_env: NeonEnv):
         )
 
     asyncio.run(both())
+
+
+# neondatabase/neon#9955: a replica's backend waits in XLogWaitForReplayOf() for the record being replayed while it
+# holds the IO of a page that the replay of that record reads next, and the two wait for each other. The test holds
+# the replay inside a record by pausing the pageserver's relation-size requests: with the relation-size cache off,
+# redo asks for the relation's size (neon_extend_rel_size) after neon_redo_read_buffer_filter() has decided about a
+# page and before it reads the page. Without the fix the backend's query ends with a statement timeout.
+PS_NBLOCKS = "ps::handle-pagerequest-message::nblocks"
+REPLAY_WAIT = "RecoveryWalStream"  # XLogWaitForReplayOf's wait event
+
+
+class _Query(threading.Thread):
+    def __init__(self, cur, sql: str):
+        super().__init__(daemon=True)
+        self.cur, self.sql = cur, sql
+        self.rows: list | None = None
+        self.error: Exception | None = None
+
+    def run(self):
+        try:
+            self.cur.execute(self.sql)
+            self.rows = self.cur.fetchall()
+        except Exception as e:
+            self.error = e
+
+
+def _monitor(ep):
+    """
+    A connection that reads wait events while the pageserver's relation-size requests are paused: from
+    pg_stat_get_activity(), as pg_stat_activity joins catalogs whose sizes its planning asks for (the relation-size
+    cache is off), and with plans made now.
+    """
+    conn = ep.connect()
+    cur = conn.cursor()
+    cur.execute("SET plan_cache_mode = force_generic_plan")
+    cur.execute("PREPARE wait_event_of(int) AS SELECT wait_event FROM pg_stat_get_activity($1)")
+    cur.execute(
+        "PREPARE startup_wait_event AS SELECT wait_event FROM pg_stat_get_activity(NULL)"
+        " WHERE backend_type = 'startup'"
+    )
+    _startup_wait_event(cur)
+    return conn, cur
+
+
+def _scalar(cur, sql: str):
+    cur.execute(sql)
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _startup_wait_event(mon) -> str | None:
+    return _scalar(mon, "EXECUTE startup_wait_event")
+
+
+def _session(ep, *statements: str):
+    """
+    A connection whose prepared statements read through an index with one plan, so a query reads no relation size.
+    Its reads don't prefetch: a read that finds its page prefetched, or in the LFC, returns it without waiting for
+    replay, and only the read that asks the pageserver itself waits.
+    """
+    conn = ep.connect()
+    cur = conn.cursor()
+    for statement in (
+        "SET plan_cache_mode = force_generic_plan",
+        "SET enable_seqscan = off",
+        "SET enable_bitmapscan = off",
+        "SET enable_indexscan_prefetch = off",
+        "SET statement_timeout = '60s'",
+        *statements,
+    ):
+        cur.execute(statement)
+    cur.execute("SELECT pg_backend_pid()")
+    return conn, cur, cur.fetchone()[0]
+
+
+def _run_until_done_or_waiting(mon, query: _Query, pid: int):
+    """Starts the query; returns once it ended or waits for replay (holding the IO of the page it reads)"""
+    query.start()
+
+    def done_or_waiting():
+        assert not query.is_alive() or _scalar(mon, f"EXECUTE wait_event_of({pid})") == REPLAY_WAIT
+
+    wait_until(done_or_waiting, timeout=60)
+
+
+def _pause_replay_in_record(ps_http, mon, primary, sql: str, before_replay):
+    """
+    Runs sql on the primary, then lets the replica (mon's) replay it until redo waits for the pageserver inside its
+    first record. The failpoint is armed only once the primary is done, as the primary asks the pageserver for
+    relation sizes too. before_replay() checks the replica just before replay goes on.
+    """
+    mon.execute("SELECT pg_wal_replay_pause()")
+    primary.safe_psql(sql)
+    flushed = Lsn(primary.safe_psql_scalar("SELECT pg_current_wal_flush_lsn()"))
+
+    def received_and_paused():
+        mon.execute("SELECT pg_last_wal_receive_lsn(), pg_get_wal_replay_pause_state()")
+        received, state = mon.fetchone()
+        assert Lsn(received) >= flushed and state == "paused"
+
+    wait_until(received_and_paused)
+    before_replay()
+    ps_http.configure_failpoints((PS_NBLOCKS, "pause"))
+    mon.execute("SELECT pg_wal_replay_resume()")
+
+    def startup_waits_for_pageserver():
+        assert "PS_ReadIO" in (_startup_wait_event(mon) or "")
+
+    wait_until(startup_waits_for_pageserver)
+
+
+@pytest.mark.skipif(
+    not USE_LFC, reason="redo replays a page missing from shared buffers only if it is in the LFC"
+)
+def test_replica_redo_of_lfc_page_no_deadlock(neon_simple_env: NeonEnv):
+    """
+    Redo replays a page that is not in shared buffers but is in the LFC. It used to give the page the record's LwLSN
+    first, so a backend reading the page before redo did waited for that record while holding the page's IO.
+    """
+    env = neon_simple_env
+    ps_http = env.pageserver.http_client()
+    ps_http.is_testing_enabled_or_skip()
+
+    primary = env.endpoints.create_start(
+        "main", endpoint_id="primary", config_lines=["autovacuum = off"]
+    )
+    primary.safe_psql_many(
+        [
+            "CREATE EXTENSION neon_test_utils",
+            "CREATE EXTENSION IF NOT EXISTS neon",
+            "CREATE TABLE t (id int PRIMARY KEY, counter int)",
+            "INSERT INTO t VALUES (1, 0)",
+            "SELECT * FROM t",
+        ]
+    )
+    replica = env.endpoints.new_replica_start(
+        origin=primary,
+        endpoint_id="replica",
+        config_lines=[
+            "neon.relsize_hash_size = 0",
+            "log_min_messages = debug2",  # the request LSN of each read (neon_get_request_lsns)
+            # Room for every chunk (1 MB each) the replica reads, so t's stays in the LFC until redo checks it
+            "neon.max_file_cache_size = 256MB",
+            "neon.file_cache_size_limit = 256MB",
+        ],
+    )
+    wait_replica_caughtup(primary, replica)
+
+    reader, rcur, rpid = _session(replica, "PREPARE q AS SELECT counter FROM t WHERE id = $1")
+    rcur.execute("EXECUTE q(1)")  # the heap page is read, so it is in the LFC
+    assert rcur.fetchone()[0] == 0
+    mconn, mon = _monitor(replica)
+    mon.execute("SELECT clear_buffer_cache()")
+    rcur.execute("EXECUTE q(-1)")  # the index again, without the heap page
+    _startup_wait_event(mon)
+    mon.execute(
+        "SELECT format('%I.local_cache', n.nspname) FROM pg_extension e"
+        " JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'neon'"
+    )
+    local_cache = mon.fetchone()[0]
+    filenode = _scalar(mon, "SELECT pg_relation_filenode('t')")
+
+    def page_in_lfc():
+        """What makes redo replay the page (the precondition of this test), checked as replay goes on"""
+        in_lfc = _scalar(
+            mon,
+            f"SELECT count(*) FROM {local_cache} WHERE relfilenode = {filenode}"
+            " AND relforknumber = 0 AND relblocknumber = 0",
+        )
+        assert in_lfc == 1, "t's page 0 is not in the LFC: redo would skip it, and nothing could deadlock"
+
+    try:
+        _pause_replay_in_record(
+            ps_http, mon, primary, "UPDATE t SET counter = 1", page_in_lfc
+        )
+        # Redo has decided to replay the page, as the LFC has it. The page leaves the LFC now (it is switched off),
+        # so the backend asks the pageserver for it.
+        mon.execute("ALTER SYSTEM SET neon.file_cache_size_limit = 0")
+        mon.execute("SELECT pg_reload_conf()")
+
+        def lfc_off():
+            assert _scalar(rcur, "SHOW neon.file_cache_size_limit") in ("0", "0MB")
+
+        wait_until(lfc_off)
+        query = _Query(rcur, "EXECUTE q(1)")
+        _run_until_done_or_waiting(mon, query, rpid)
+    finally:
+        ps_http.configure_failpoints((PS_NBLOCKS, "off"))
+    query.join(120)
+
+    assert query.error is None, f"the replica's query failed: {query.error}"
+    assert query.rows is not None and query.rows[0][0] in (0, 1)
+    wait_replica_caughtup(primary, replica)
+    assert replica.safe_psql("SELECT counter FROM t")[0][0] == 1
+    reader.close()
+    mconn.close()
+

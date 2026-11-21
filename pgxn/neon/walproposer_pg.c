@@ -97,6 +97,15 @@ static void assign_neon_safekeepers(const char *newval, void *extra);
 static uint64 backpressure_lag_impl(void);
 static uint64 hadron_backpressure_lag_impl(void);
 static uint64 startup_backpressure_wrap(void);
+static uint64 wal_insert_backpressure_lag(void);
+
+/*
+ * Set when one of this backend's own WAL insertions found the safekeepers or
+ * pageservers lagging, cleared once the lag is gone: a backend writing WAL
+ * without a transaction id (VACUUM, autovacuum) is throttled as one holding an
+ * xid is (neondatabase/neon#5049).
+ */
+static bool wrote_wal_while_lagging = false;
 static bool backpressure_throttling_impl(void);
 static void walprop_register_bgworker(void);
 
@@ -563,9 +572,23 @@ startup_backpressure_wrap(void)
 	if (AmStartupProcess() || !IsUnderPostmaster)
 		return 0;
 
-	delay_backend_us = &hadron_backpressure_lag_impl;
+	delay_backend_us = &wal_insert_backpressure_lag;
 
-	return hadron_backpressure_lag_impl();
+	return wal_insert_backpressure_lag();
+}
+
+/*
+ * The lag as XLogInsert asks for it (delay_backend_us is called only there):
+ * a lag found records that this backend writes WAL while it lasts.
+ */
+static uint64
+wal_insert_backpressure_lag(void)
+{
+	uint64		lag = hadron_backpressure_lag_impl();
+
+	if (lag > 0)
+		wrote_wal_while_lagging = true;
+	return lag;
 }
 
 /*
@@ -644,13 +667,24 @@ backpressure_throttling_impl(void)
 	 */
 	if (am_walsender
 		|| (!(MyProc->statusFlags & PROC_IN_SAFE_IC)
-			&& !TransactionIdIsValid(GetCurrentTransactionIdIfAny())))
+			&& !TransactionIdIsValid(GetCurrentTransactionIdIfAny())
+			/*
+			 * Nor a backend that writes WAL without a transaction id, unless
+			 * its own insertions found the lag: VACUUM and autovacuum are
+			 * throttled then, the checkpointer and other auxiliary processes
+			 * never (neondatabase/neon#5049)
+			 */
+			&& !(wrote_wal_while_lagging
+				 && (AmRegularBackendProcess() || AmAutoVacuumWorkerProcess()))))
 		return retry;
 
 	/* Calculate replicas lag */
 	lag = hadron_backpressure_lag_impl();
 	if (lag == 0)
+	{
+		wrote_wal_while_lagging = false;
 		return retry;
+	}
 
 	old_status = get_ps_display(&len);
 	new_status = (char *) palloc(len + 64 + 1);

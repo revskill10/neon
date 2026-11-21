@@ -41,6 +41,8 @@ extern bool lfc_cache_contains(NRelFileInfo rinfo, ForkNumber forkNum,
 							   BlockNumber blkno);
 extern int lfc_cache_containsv(NRelFileInfo rinfo, ForkNumber forkNum,
 							   BlockNumber blkno, int nblocks, bits8 *bitmap);
+extern bool lfc_cache_contains_else_set_lwlsn(NRelFileInfo rinfo, ForkNumber forkNum,
+											  BlockNumber blkno, XLogRecPtr lsn);
 extern void lfc_init(void);
 extern bool lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 						 const void* buffer, XLogRecPtr lsn);

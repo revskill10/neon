@@ -58,7 +58,7 @@ jobs:
             echo "## Advisories"
             [ "$ADVISORIES" = success ] && echo "None outside deny.toml's ignores." || echo "**Found:** see the advisories step of $RUN."
             echo; echo "## Postgres 17"
-            [ "$newer" = yes ] && echo "**$LATEST is out; we carry $OURS.** Port it from neondatabase/postgres's REL_17_STABLE_neon." || echo "We carry $OURS, the latest."
+            [ "$newer" = yes ] && echo "**$LATEST is out; we carry $OURS.** Merge its REL_17_* tag into revskill10/postgres's REL_17_STABLE_hb, then move vendor/postgres-v17 and vendor/revisions.json." || echo "We carry $OURS, the latest."
             echo; echo "## Upstream this week ($UPSTREAM opened)"
             cat upstream.md
           } >> "$GITHUB_STEP_SUMMARY"

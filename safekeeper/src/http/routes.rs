@@ -657,7 +657,8 @@ async fn dump_debug_handler(mut request: Request<Body>) -> Result<Response<Body>
 
     let body = Body::wrap_stream(ReceiverStream::new(rx));
 
-    let mut writer = ChannelWriter::new(128 * 1024, tx);
+    // A client that stops reading gives the blocking thread back (neondatabase/neon#12954)
+    let mut writer = ChannelWriter::new(128 * 1024, tx).with_stall_timeout(http_utils::endpoint::CLIENT_STALL_TIMEOUT);
 
     let response = Response::builder()
         .status(200)
@@ -687,10 +688,12 @@ async fn dump_debug_handler(mut request: Request<Body>) -> Result<Response<Body>
                 // abort the response to somehow notify the client that we failed.
                 //
                 // though, most likely the reason for failure is that the receiver is already gone.
+                // Never waits: a client that stopped reading leaves the channel full, and waiting for it would hold
+                // this blocking thread again (neondatabase/neon#12954); dropping the writer ends the stream anyway.
                 drop(
                     writer
                         .tx
-                        .blocking_send(Err(std::io::ErrorKind::BrokenPipe.into())),
+                        .try_send(Err(std::io::ErrorKind::BrokenPipe.into())),
                 );
             }
         }

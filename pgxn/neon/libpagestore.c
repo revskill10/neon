@@ -767,6 +767,35 @@ pageserver_connect(shardno_t shard_no, int elevel)
 			}
 		}
 
+		/*
+		 * The pageserver answers the pagestream request with COPY BOTH, or
+		 * with an error (an unknown tenant or timeline, say) on a connection
+		 * that stays open. Only COPY BOTH is a connection: anything else is a
+		 * failed attempt, so the reconnect backoff applies to it instead of
+		 * being reset below (neondatabase/neon#8180).
+		 */
+		{
+			PGresult   *result = PQgetResult(shard->conn);
+			ExecStatusType status = result ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+
+			if (status != PGRES_COPY_BOTH)
+			{
+				char	   *msg = result
+					? pchomp(PQresultErrorMessage(result))
+					: pchomp(PQerrorMessage(shard->conn));
+
+				if (result)
+					PQclear(result);
+				CLEANUP_AND_DISCONNECT(shard);
+				neon_shard_log(shard_no, elevel,
+							   "could not start the pagestream with pageserver (%s): %s",
+							   PQresStatus(status), msg);
+				pfree(msg);
+				return false;
+			}
+			PQclear(result);
+		}
+
 		shard->state = PS_Connected;
 		shard->nrequests_sent = 0;
 		shard->nresponses_received = 0;
@@ -777,10 +806,12 @@ pageserver_connect(shardno_t shard_no, int elevel)
 	/* FALLTHROUGH */
 	case PS_Connected:
 		/*
-		 * We successfully connected. Future connections to this PageServer
-		 * will do fast retries again, with exponential backoff.
+		 * Connected, but not yet answered: the reconnect backoff is reset by
+		 * the first response received (pageserver_receive), not here. A
+		 * pageserver that takes the pagestream and ends it at once (a tenant
+		 * it does not hold) would otherwise be retried without delay, in a
+		 * loop (neondatabase/neon#8180).
 		 */
-		shard->delay_us = MIN_RECONNECT_INTERVAL_USEC;
 
 		neon_shard_log(shard_no, DEBUG5, "Connection state: Connected");
 		neon_shard_log(shard_no, LOG, "libpagestore: connected to '%s' with protocol version %d", connstr, neon_protocol_version);
@@ -1301,6 +1332,14 @@ pageserver_receive(shardno_t shard_no)
 		neon_shard_log(shard_no, ERROR, "pageserver_receive disconnect: unexpected PQgetCopyData return value: %d", rc);
 	}
 
+	if (resp != NULL)
+	{
+		/*
+		 * Answered: future connections to this pageserver do fast retries
+		 * again, with exponential backoff (neondatabase/neon#8180)
+		 */
+		shard->delay_us = MIN_RECONNECT_INTERVAL_USEC;
+	}
 	shard->nresponses_received++;
 	return (NeonResponse *) resp;
 }
@@ -1393,6 +1432,14 @@ pageserver_try_receive(shardno_t shard_no)
 		neon_shard_log(shard_no, ERROR, "refresh_configuration request failed, cancelling query");
 	}
 
+	if (resp != NULL)
+	{
+		/*
+		 * Answered: future connections to this pageserver do fast retries
+		 * again, with exponential backoff (neondatabase/neon#8180)
+		 */
+		shard->delay_us = MIN_RECONNECT_INTERVAL_USEC;
+	}
 	shard->nresponses_received++;
 	return (NeonResponse *) resp;
 }
