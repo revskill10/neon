@@ -1,0 +1,18 @@
+--- a/pg_search/src/postgres/build.rs
++++ b/pg_search/src/postgres/build.rs
+@@ -47,9 +47,12 @@
+     // Capture the relation's inherent WAL-needed flag before suppressing WAL during build.
+     let needs_wal = index_relation.need_wal();
+ 
+-    // Do not emit WAL records inside the tuple insertion/page building loop.
+-    // Instead, log all pages to the WAL at the end of the build via log_newpage_range.
+-    index_relation.set_need_wal(false);
++    // Neon: every page is WAL-logged as it is written, as aminsert writes them. Neon's storage
++    // manager refuses to evict a dirty page that has no LSN (PANIC "evicted with zero LSN"), and
++    // a build's pages are evicted while it runs once the index outgrows shared_buffers, by the
++    // building backend, its parallel workers or the background writer. Upstream builds
++    // unlogged (index_relation.set_need_wal(false)) and logs every page at the end; that end
++    // logging is kept below, so the pageserver also has each page's final image.
+ 
+     unsafe {
+         build_empty(&index_relation);

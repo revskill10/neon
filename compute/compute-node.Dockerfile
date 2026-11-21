@@ -1168,10 +1168,14 @@ USER root
 FROM build-deps AS pg-search-src
 ARG PG_VERSION
 WORKDIR /ext-src
+# Its index build WAL-logs each page as it writes it (compute/patches/pg_search.patch): upstream builds unlogged and
+# logs at the end, and Neon's smgr PANICs on a page evicted mid-build with no LSN
+COPY compute/patches/pg_search.patch .
 RUN case "${PG_VERSION:?}" in "v17") ;; *) echo "pg_search is built for v17 only" && exit 0;; esac && \
     wget https://github.com/paradedb/paradedb/archive/refs/tags/v0.26.0.tar.gz -O paradedb.tar.gz && \
     echo "5b86e1ccdf1a6cd75099ad22c01dc182ab4a279df644cf39d7cf0e86ea7c0630 paradedb.tar.gz" | sha256sum --check && \
     mkdir paradedb-src && cd paradedb-src && tar xzf ../paradedb.tar.gz --strip-components=1 -C . && \
+    patch -p1 < /ext-src/pg_search.patch && \
     echo "#nothing to test here" > neon-test.sh
 
 FROM pg-build-with-cargo AS pg-search-build
