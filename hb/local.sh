@@ -11,6 +11,11 @@
 #   hb/local.sh pytest <pytest arguments>   builds what the Python tests run (the binaries with cargo's testing
 #                                       feature, Postgres 17 and its extensions), shows the installed neon.so beside
 #                                       the newest pgxn/neon sources, and runs those tests (test_runner)
+#   hb/local.sh pg-search               builds the compute's pg_search (compute/compute-node.Dockerfile, its stage
+#                                       pg-search-build: Neon's Postgres 17 and compute/patches/pg_search.patch) from
+#                                       this commit, as the hb images workflow builds the compute, and tags it
+#                                       pg-search-neon:<commit>; its /usr/local/pgsql/lib/pg_search.so put in the
+#                                       pinned compute is a compute with the patch, for the platform's Neon Docker tests
 #
 # HB_LOCAL_MEMORY (default 7g) caps the container; HB_LOCAL_JOBS (default 4) caps cargo's jobs.
 set -euo pipefail
@@ -55,5 +60,14 @@ case "$command" in
   test)    run "cargo test --locked $(crates "$@")" ;;
   clippy)  run "cargo clippy --locked $(crates "$@") -- -D warnings" ;;
   pytest)  run "make -s -j${HB_LOCAL_JOBS:-4} BUILD_DIR=$pg_build POSTGRES_INSTALL_DIR=$pg_install POSTGRES_VERSIONS=v17 NEON_CARGO_ARTIFACT_TARGET_DIR=$target/debug CARGO_BUILD_FLAGS='--locked --features testing' all && ls -lt --time-style=full-iso \$($pg_install/v17/bin/pg_config --pkglibdir)/neon.so pgxn/neon/*.c | head -3 && poetry install --no-root -q && NEON_BIN=$target/debug POSTGRES_DISTRIB_DIR=$pg_install DEFAULT_PG_VERSION=17 BUILD_TYPE=debug TEST_OUTPUT=$test_output poetry run pytest $*" ;;
-  *) sed -n '2,15p' "$0"; exit 1 ;;
+  # From the commit itself, not the working tree: a Windows checkout's line endings break the build's shell scripts, and
+  # Postgres is the commit vendor/postgres-v17 names (git archive leaves submodules out)
+  pg-search)
+    commit="$(git rev-parse --short=9 HEAD)"; context="$(mktemp -d)"; trap 'rm -rf "$context"' EXIT
+    git -c core.autocrlf=false archive HEAD | tar -x -C "$context"
+    mkdir -p "$context/vendor/postgres-v17" && git -C vendor/postgres-v17 -c core.autocrlf=false archive "$(git rev-parse HEAD:vendor/postgres-v17)" | tar -x -C "$context/vendor/postgres-v17"
+    docker build --target pg-search-build --build-arg PG_VERSION=v17 --build-arg EXTENSIONS=hb --build-arg DEBIAN_VERSION=bookworm \
+      -t "pg-search-neon:$commit" -f "$context/compute/compute-node.Dockerfile" "$context"
+    echo "pg-search-neon:$commit" ;;
+  *) sed -n '2,20p' "$0"; exit 1 ;;
 esac
